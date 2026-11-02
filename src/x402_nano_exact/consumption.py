@@ -34,6 +34,7 @@ Three guarantees, all enforced atomically in ``consume``:
 
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -209,26 +210,38 @@ def canonical_request_key(
     pairs (e.g. ``list(request.query_params.multi_items())``). Multi-value form
     is preferred: ``dict(QueryParams)`` collapses repeated keys (``a=1&a=2``
     becomes ``{'a': '2'}`` and would collide with ``a=2``), whereas the pair
-    form keeps every value distinct so ``a=1&a=2`` and ``a=2`` differ.
+    form keeps every value distinct so ``a=1&a=2`` and ``a=2`` differ. A dict
+    value may be a list of strings for a repeated key.
+
+    The key is a JSON document of the decoded components (the query as a
+    sorted list of ``[key, value]`` pairs), so two distinct requests never
+    share a key.
     """
-    parts = [method.upper(), path]
+    # Every component is carried as a structured value and the whole key is a
+    # single JSON document, so no delimiter inside a decoded path, query key,
+    # query value or body value can be confused with the key's own structure
+    # (e.g. ``a=1&a=2`` vs ``a=1%262``, or path ``/p`` + ``a=1`` vs a path
+    # that decodes to ``/p|query:a=1``).
+    pairs: list[tuple[str, str]] = []
     if query:
-        if isinstance(query, dict):
-            pairs = list(query.items())
-        else:
-            pairs = list(query)
-        # Group every (key, value) pair per key, preserving all values so a
-        # repeated query key (a=1&a=2) stays distinguishable from a=2.
-        grouped: dict[str, list[str]] = {}
-        for k, v in pairs:
+        items = query.items() if isinstance(query, dict) else query
+        for k, v in items:
             if query_include is not None and k not in query_include:
                 continue
-            grouped.setdefault(k, []).append(str(v))
-        normalized = sorted(
-            f"{k}={'&'.join(sorted(v))}" for k, v in sorted(grouped.items())
-        )
-        parts.append("query:" + "&".join(normalized))
+            values = v if isinstance(v, (list, tuple)) else [v]
+            pairs.extend((str(k), str(one)) for one in values)
+    # Order-insensitive: the same multiset of decoded (key, value) pairs in a
+    # different order (``b=2&a=1`` vs ``a=1&b=2``, ``a=2&a=1`` vs ``a=1&a=2``)
+    # is the same request.
+    pairs.sort()
+    canonical: dict = {
+        "method": method.upper(),
+        "path": path,
+        "query": [list(p) for p in pairs],
+    }
     if body_include:
         picked = {k: body.get(k) for k in body_include if isinstance(body, dict) and k in body}
-        parts.append("body:" + repr(sorted(picked.items())))
-    return "|".join(parts)
+        canonical["body"] = picked
+    return json.dumps(
+        canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    )

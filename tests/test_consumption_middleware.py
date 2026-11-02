@@ -307,3 +307,83 @@ def test_example_registers_guard_inner_to_x402_verify():
         "nano_consumption_middleware must be registered BEFORE payment_middleware "
         "so x402 verifies outermost and this guard gates in the verified slot"
     )
+
+# ------------------------------------- unambiguous key encoding (after f0b3e89)
+
+
+def _first_then_second(first_qs: bytes, second_qs: bytes):
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+    g = gate(node, store)
+    r1 = run(g, make_request(verified_state(), query_string=first_qs), handler)
+    r2 = run(g, make_request(verified_state(), query_string=second_qs), handler)
+    return r1, r2, handler
+
+
+def test_repeated_key_does_not_collide_with_encoded_ampersand_value():
+    """a=1&a=2 decodes to [(a,1),(a,2)]; a=1%262 decodes to [(a,'1&2')]."""
+    r1, r2, handler = _first_then_second(b"a=1&a=2", b"a=1%262")
+    assert r1.status_code == 200
+    assert r2.status_code == 409
+    assert handler.runs == 1
+    assert "consumed by another request" in r2.body.decode()
+
+
+def test_two_keys_do_not_collide_with_encoded_pair_in_one_value():
+    """a=1&b=2 decodes to [(a,1),(b,2)]; a=1%26b%3D2 decodes to [(a,'1&b=2')]."""
+    r1, r2, handler = _first_then_second(b"a=1&b=2", b"a=1%26b%3D2")
+    assert r1.status_code == 200
+    assert r2.status_code == 409
+    assert handler.runs == 1
+
+
+def test_encoded_value_first_then_plain_pairs_also_refused():
+    r1, r2, handler = _first_then_second(b"a=1%262", b"a=1&a=2")
+    assert r1.status_code == 200
+    assert r2.status_code == 409
+    assert handler.runs == 1
+
+
+def test_same_pairs_in_different_order_is_the_same_request():
+    """The key is order-insensitive over decoded pairs: b=2&a=1 replays a=1&b=2."""
+    r1, r2, handler = _first_then_second(b"a=1&b=2", b"b=2&a=1")
+    assert r1.status_code == 200
+    assert handler.runs == 1
+    assert "replayed" in r2.body.decode()
+
+
+def test_decoded_path_cannot_imitate_query_part():
+    """A decoded path containing the old delimiters must not equal path + query."""
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+    g = gate(node, store)
+    r1 = run(g, make_request(verified_state(), path="/api/paid", query_string=b"a=1"), handler)
+    r2 = run(g, make_request(verified_state(), path="/api/paid|query:a=1"), handler)
+    assert r1.status_code == 200
+    assert r2.status_code == 409
+    assert handler.runs == 1
+
+
+def test_canonical_key_components_are_unambiguous():
+    k = canonical_request_key
+    assert k(method="GET", path="/p", query=[("a", "1"), ("a", "2")]) != k(
+        method="GET", path="/p", query=[("a", "1&2")]
+    )
+    assert k(method="GET", path="/p", query=[("a", "1"), ("b", "2")]) != k(
+        method="GET", path="/p", query=[("a", "1&b=2")]
+    )
+    assert k(method="GET", path="/p", query=[("a=1", "")]) != k(method="GET", path="/p", query=[("a", "1")])
+    assert k(method="GET", path="/p", query=[("a", "1")]) != k(method="GET", path="/p|query:a=1")
+    assert k(method="GET", path="/p", query={"a": ["1", "2"]}) == k(
+        method="GET", path="/p", query=[("a", "2"), ("a", "1")]
+    )
+    # body values cannot imitate a second body field
+    assert k(method="POST", path="/p", body_include=["a", "b"], body={"a": "x", "b": "y"}) != k(
+        method="POST", path="/p", body_include=["a", "b"], body={"a": "x', 'b': 'y"}
+    )
+    # body inputs keep their JSON types
+    assert k(method="POST", path="/p", body_include=["a"], body={"a": 1}) != k(
+        method="POST", path="/p", body_include=["a"], body={"a": "1"}
+    )
