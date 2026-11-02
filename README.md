@@ -169,9 +169,10 @@ server.initialize()
 routes = {"GET /api/weather": {"accepts": [{"scheme": "exact", "network": "nano:mainnet", "payTo": "nano_...", "price": "0.01"}]}}
 
 app = FastAPI()
-# Outer: x402's verify -> handler -> settle flow.
-app.middleware("http")(payment_middleware(routes, server))
-# Inner (registered after): confirm cementation + bind the payment to one request.
+# Register the guard FIRST; Starlette runs the LAST-added middleware first, so
+# x402's verify ends up outermost and this guard runs in the verified-but-
+# before-handler slot. Registered the other way round, the guard would run
+# before the SDK verified anything and pass all requests through un-gated.
 app.middleware("http")(
     nano_consumption_middleware(
         ConfirmationAuthority(HttpNanoNode()),           # Nano RPC = the confirmation authority
@@ -179,6 +180,8 @@ app.middleware("http")(
         body_include=["prompt"],                          # bind to these body/query inputs too
     )
 )
+# Outer (registered last -> runs first): x402's verify -> handler -> settle flow.
+app.middleware("http")(payment_middleware(routes, server))
 ```
 
 What it enforces for every `nano:mainnet` / `exact` verified payment:

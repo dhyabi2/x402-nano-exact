@@ -10,6 +10,8 @@ funding or mainnet enablement.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
@@ -209,3 +211,99 @@ def test_aged_out_pending_request_declares_outcome_unknown(tmp_path):
     d = consume(store, send_hash=HASH, request_key=key, age_out_seconds=30.0, now=2_000.0)
     assert d.kind == "outcome_unknown"
     assert store.get(HASH).status == "outcome_unknown"
+
+
+# ------------------------------------------------- Lucian's review regressions
+# (epistemedeus, pursekeeper/x402-nano-exact#4, 2026-11-02)
+
+
+def test_repeated_query_key_is_distinct_from_single_value():
+    """a=1&a=2 must NOT collide with a=2 (dict(QueryParams) collapsed them)."""
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+
+    g = gate(node, store)
+    # a=1&a=2 on the wire -> multi_items() preserves both values
+    r1 = run(g, make_request(verified_state(), query_string=b"a=1&a=2"), handler)
+    assert r1.status_code == 200
+    assert handler.runs == 1
+
+    # a=2 (only one value) must be treated as a DIFFERENT request -> reuse rejected
+    r2 = run(g, make_request(verified_state(), query_string=b"a=2"), handler)
+    assert handler.runs == 1
+    assert r2.status_code == 409
+    assert "consumed by another request" in r2.body.decode()
+
+
+def test_unchanged_repeated_query_key_is_same_request():
+    """The same repeated query values (same order-insensitive multiset) replay."""
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+    g = gate(node, store)
+
+    r1 = run(g, make_request(verified_state(), query_string=b"a=1&a=2"), handler)
+    r2 = run(g, make_request(verified_state(), query_string=b"a=2&a=1"), handler)
+    assert handler.runs == 1
+    assert "replayed" in r2.body.decode()
+
+
+def test_body_include_reads_and_binds_the_request_body():
+    """body_include=[\"prompt\"] must bind the actual JSON body, and the handler
+    must still be able to read it (the body is replayed, not consumed)."""
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(":memory:")
+
+    seen_body = {}
+
+    class BodyHandler:
+        def __init__(self):
+            self.runs = 0
+
+        async def __call__(self, request):
+            self.runs += 1
+            seen_body["prompt"] = (await request.body()).decode()
+            b = getattr(request.state, "consumption_body", None)
+            seen_body["state"] = b
+            return JSONResponse({"ok": True, "run": self.runs})
+
+    mw = nano_consumption_middleware(
+        ConfirmationAuthority(node), store, body_include=["prompt"], age_out_seconds=60.0
+    )
+    body = b'{"prompt": "hello"}'
+    resp = run(mw, make_request(verified_state(), body=body), BodyHandler())
+    assert resp.status_code == 200
+    # the guard parsed the body and bound it
+    assert seen_body["state"] == {"prompt": "hello"}
+    # the handler still read the body
+    assert "hello" in seen_body["prompt"]
+
+    # A different body on a retry with the same confirmed hash must be rejected
+    # (the payment was bound to prompt=hello, not prompt=other).
+    seen_body.clear()
+    resp2 = run(mw, make_request(verified_state(), body=b'{"prompt": "other"}'), BodyHandler())
+    assert resp2.status_code == 409
+    assert "consumed by another request" in resp2.body.decode()
+
+
+def test_example_registers_guard_inner_to_x402_verify():
+    """The documented composition must make x402's verify run OUTERMOST and this
+    guard run in the verified-but-before-handler slot.
+
+    Starlette runs the LAST-registered middleware first. The example must
+    therefore register ``nano_consumption_middleware`` before
+    ``payment_middleware``. Registered the other way round, the guard would run
+    before the SDK verified anything, see no payment state, and pass every
+    request through un-gated - the ordering bug Lucian found.
+    """
+    example = Path(__file__).resolve().parents[1] / "examples" / "fastapi_consumption.py"
+    src = example.read_text()
+
+    guard_pos = src.find("nano_consumption_middleware(")
+    pay_pos = src.find("payment_middleware(routes, server)")
+    assert guard_pos != -1 and pay_pos != -1, "example must reference both middlewares"
+    assert guard_pos < pay_pos, (
+        "nano_consumption_middleware must be registered BEFORE payment_middleware "
+        "so x402 verifies outermost and this guard gates in the verified slot"
+    )

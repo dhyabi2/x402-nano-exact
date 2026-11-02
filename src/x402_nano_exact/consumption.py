@@ -193,7 +193,7 @@ def canonical_request_key(
     *,
     method: str,
     path: str,
-    query: dict[str, str | list[str]] | None = None,
+    query: dict[str, str | list[str]] | list[tuple[str, str]] | None = None,
     query_include: list[str] | None = None,
     body_include: list[str] | None = None,
     body: dict | None = None,
@@ -204,16 +204,28 @@ def canonical_request_key(
     set of query params, and a caller-chosen set of body inputs), never to a
     caller-chosen request id alone, so the same payment cannot be re-used
     against a changed request body the payer never bought.
+
+    ``query`` may be a ``{key: value}`` dict or a sequence of ``(key, value)``
+    pairs (e.g. ``list(request.query_params.multi_items())``). Multi-value form
+    is preferred: ``dict(QueryParams)`` collapses repeated keys (``a=1&a=2``
+    becomes ``{'a': '2'}`` and would collide with ``a=2``), whereas the pair
+    form keeps every value distinct so ``a=1&a=2`` and ``a=2`` differ.
     """
     parts = [method.upper(), path]
     if query:
-        effective = {
-            k: v
-            for k, v in query.items()
-            if query_include is None or k in query_include
-        }
+        if isinstance(query, dict):
+            pairs = list(query.items())
+        else:
+            pairs = list(query)
+        # Group every (key, value) pair per key, preserving all values so a
+        # repeated query key (a=1&a=2) stays distinguishable from a=2.
+        grouped: dict[str, list[str]] = {}
+        for k, v in pairs:
+            if query_include is not None and k not in query_include:
+                continue
+            grouped.setdefault(k, []).append(str(v))
         normalized = sorted(
-            f"{k}={sorted(v) if isinstance(v, list) else v}" for k, v in effective.items()
+            f"{k}={'&'.join(sorted(v))}" for k, v in sorted(grouped.items())
         )
         parts.append("query:" + "&".join(normalized))
     if body_include:

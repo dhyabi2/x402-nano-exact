@@ -1,21 +1,27 @@
 """FastAPI middleware that adds confirmation + single-use consumption control.
 
-Compose it around the SDK's own ``payment_middleware`` (which does the
-``verify -> handler -> settle`` flow). Middleware ordering matters:
+Compose it INSIDE the SDK's own ``payment_middleware`` (which does the
+``verify -> handler -> settle`` flow). Middleware ordering matters, and
+Starlette's rule is: **the last-registered middleware runs first (outermost)**
+(`add_middleware` inserts at index 0). So register the guard FIRST and x402's
+``payment_middleware`` AFTER it:
 
-    app.middleware("http")(payment_middleware(routes, server))          # outer
-    app.middleware("http")(nano_consumption_middleware(guard, store))   # inner
+    app.middleware("http")(nano_consumption_middleware(guard, store))   # 1st -> inner
+    app.middleware("http")(payment_middleware(routes, server))          # 2nd -> OUTER
 
-Starlette runs the outermost middleware first and each middleware's
-``call_next`` penetrates inward to the endpoint handler. So this middleware,
-registered *after* x402's, runs in the verified-but-before-handler slot: it
-reads ``request.state.payment_payload`` / ``payment_requirements`` (which x402
-sets when a payment is verified) and, for ``nano:mainnet``/``exact``, enforces
+That puts x402's verify outermost and this guard in the verified-but-before-
+handler slot: x402 sets ``request.state.payment_payload`` /
+``payment_requirements`` on verify, then ``call_next`` penetrates inward to
+this guard, which - for ``nano:mainnet``/``exact`` - enforces
 
 1. confirmation of the exact quoted send hash (cementation + matching quote),
 2. single-use consumption bound to the canonical protected request, and
 3. crash-safe outcome handling (a retry of the same request recovers the
    stored outcome; a different request reusing the payment is rejected).
+
+Registered the other way round (guard after x402's) the guard would run BEFORE
+the SDK verified anything, see no verified payment state, and pass every
+request through un-gated - confirming nothing and binding nothing.
 
 If the route is not a Nano x402 route (or the SDK did not verify anything),
 the middleware passes straight through: it only ever gates what is already
@@ -24,6 +30,7 @@ concretely a verified nano:mainnet exact payment.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
@@ -140,10 +147,14 @@ class NanoConsumptionMiddleware:
             return self._unconfirmed_response(check)
 
         # Build the canonical request key (bind to the request, not a caller id).
+        # Pass the raw multi_items() pairs, NOT dict(request.params):
+        # the dict collapses repeated keys (a=1&a=2 would collide with a=2).
+        if self._body_include:
+            await self._capture_body(request)
         key = canonical_request_key(
             method=request.method,
             path=request.scope.get("root_path", "") + request.url.path,
-            query=dict(request.query_params),
+            query=list(request.query_params.multi_items()),
             query_include=self._query_include,
             body_include=self._body_include,
             body=getattr(request.state, "consumption_body", None),
@@ -156,6 +167,38 @@ class NanoConsumptionMiddleware:
             age_out_seconds=self._age_out_seconds,
         )
         return await self._apply_decision(request, call_next, decision, send_hash)
+
+    async def _capture_body(self, request: Request) -> None:
+        """Read the request body once, keep it replayable, and store parsed JSON.
+
+        ``body_include`` binds the payment to specific body inputs. FastAPI can
+        only consume the request body once, so we read it here, cache the bytes
+        in ``request.scope``, replace the receive channel with one that replays
+        them (so the endpoint handler can still read them), and stash the parsed
+        JSON in ``request.state.consumption_body``. A non-JSON (or empty) body
+        is left as ``None`` and simply binds to whatever body inputs resolve.
+        """
+        body = await request.body()
+        request.scope["_consumption_body_bytes"] = body
+
+        async def replay_receive():
+            message = await request.receive()
+            if message.get("type") != "http.request":
+                return message
+            buffered = request.scope.get("_consumption_body_bytes")
+            if buffered is not None:
+                request.scope["_consumption_body_bytes"] = None
+                return {**message, "body": buffered, "more_body": False}
+            return message
+
+        request._receive = replay_receive
+        if body:
+            try:
+                request.state.consumption_body = json.loads(body)
+            except Exception:  # non-JSON body: bind nothing specific
+                request.state.consumption_body = None
+        else:
+            request.state.consumption_body = None
 
     async def _apply_decision(
         self,

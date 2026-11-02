@@ -1,11 +1,12 @@
 """FastAPI seller accepting XNO on nano:mainnet with confirmation + single-use
 consumption binding.
 
-Composes this package's ``nano_consumption_middleware`` around the x402 SDK's
-``payment_middleware`` (registered after it, so it runs in the verified-but-
-before-handler slot). Every ``nano:mainnet``/``exact`` payment is served only
-once its quoted send block is cemented by the Nano RPC node (default
-https://rpc.nano.to) and bound to exactly one protected request.
+Composes this package's ``nano_consumption_middleware`` inside the x402 SDK's
+``payment_middleware``: the guard is registered FIRST (so it is inner) and x402's
+``payment_middleware`` is registered after it, which in Starlette makes x402 run
+outermost (the last ``add_middleware`` runs first). Every ``nano:mainnet``/``exact``
+payment is served only once its quoted send block is cemented by the Nano RPC
+node (default https://rpc.nano.to) and bound to exactly one protected request.
 
 Run:  pip install "x402[fastapi,httpx]" x402-nano-exact
       uvicorn fastapi_consumption:app --port 4021
@@ -50,9 +51,13 @@ routes = {
 }
 
 app = FastAPI()
-# Outer: x402's own verify -> handler -> settle flow (takes a real payment).
-app.middleware("http")(payment_middleware(routes, server))
-# Inner: confirm cementation + bind the payment to exactly one request.
+# Register the consumption guard FIRST so x402's own payment middleware is
+# added after it and thus runs OUTERMOST. Starlette inserts each middleware at
+# index 0, so the LAST registered runs first. If the guard were registered
+# after x402's (as in the earlier draft), the guard would run BEFORE the SDK
+# ever verified the payment - it would see no verified payment state and pass
+# every request through un-gated. This order guarantees verify -> guard ->
+# handler -> settle.
 app.middleware("http")(
     nano_consumption_middleware(
         ConfirmationAuthority(HttpNanoNode()),       # the confirmation authority
@@ -61,6 +66,8 @@ app.middleware("http")(
         age_out_seconds=300.0,
     )
 )
+# Outer: x402's own verify -> handler -> settle flow (takes a real payment).
+app.middleware("http")(payment_middleware(routes, server))
 
 
 @app.post("/api/chat")
