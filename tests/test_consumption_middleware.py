@@ -1,0 +1,211 @@
+"""Offline end-to-end tests of the Nano consumption middleware.
+
+Drives the middleware through the real **FastAPI/Starlette request path** with
+deterministic doubles (a fake Nano node + a real SQLite consumption store). A
+verified payment is injected the exact way the x402 SDK's ``payment_middleware``
+leaves it on ``request.state`` (``payment_payload`` + ``payment_requirements``),
+so every case exercises the real middleware path without a live transfer,
+funding or mainnet enablement.
+"""
+
+from __future__ import annotations
+
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
+
+from x402.schemas import PaymentPayload, PaymentRequirements
+from x402_nano_exact.confirmation import BlockFacts, ConfirmationAuthority
+from x402_nano_exact.consumption import ConsumptionRow, canonical_request_key
+from x402_nano_exact.middleware import nano_consumption_middleware
+from x402_nano_exact.sqlite_store import SqliteConsumptionStore
+
+from .conftest import PAY_TO
+
+NETWORK = "nano:mainnet"
+RAW_AMOUNT = "10000000000000000000000000000"
+HASH = "D" * 64
+OTHER = "nano_3mqq6kpu4b56w1afgouwumfc8juriqe3w1t14xf1f3tgc8fn4puefh9fiiw3"
+
+
+class FakeNanoNode:
+    def __init__(self, *, cemented=True, payee=None, amount=None):
+        self.cemented_set = {HASH} if cemented else set()
+        self.facts = {HASH: BlockFacts(payee or PAY_TO, amount or RAW_AMOUNT)}
+
+    def is_cemented(self, block_hash: str) -> bool:
+        return block_hash in self.cemented_set
+
+    def block_facts(self, block_hash: str) -> BlockFacts:
+        return self.facts.get(block_hash, BlockFacts(None, None))
+
+
+class FakeHandler:
+    def __init__(self):
+        self.runs = 0
+
+    async def __call__(self, request: Request) -> Response:
+        self.runs += 1
+        return JSONResponse({"ok": True, "run": self.runs})
+
+
+def make_request(state, path="/api/paid", method="POST", query_string=b"", body=None):
+    """Build a Starlette Request carrying the verified-payment state on the wire."""
+
+    async def send(_):
+        pass
+
+    async def receive():
+        return {"type": "http.request", "body": body or b"", "more_body": False}
+
+    route = Route(path, lambda r: JSONResponse({}), methods=[method])
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "raw_path": path.encode(),
+        "root_path": "",
+        "scheme": "http",
+        "server": ("test", 80),
+        "client": ("1.2.3.4", 1234),
+        "query_string": query_string,
+        "headers": [],
+        "route": route,
+    }
+    req = Request(scope, receive=receive)
+    for key, value in state.items():
+        setattr(req.state, key, value)
+    return req
+
+
+def verified_state(payload_hash=HASH):
+    req = PaymentRequirements(
+        scheme="exact", network=NETWORK, asset="XNO", amount=RAW_AMOUNT, payTo=PAY_TO, maxTimeoutSeconds=60
+    )
+    payload = PaymentPayload(x402_version=2, accepted=req, payload={"block": {"hash": payload_hash}})
+    return {"payment_payload": payload, "payment_requirements": req}
+
+
+def run(middleware, req, handler):
+    import asyncio
+
+    async def _run():
+        return await middleware(req, handler)
+
+    return asyncio.run(_run())
+
+
+def gate(node, store):
+    return nano_consumption_middleware(
+        ConfirmationAuthority(node), store, age_out_seconds=60.0
+    )
+
+
+# ---------------------------------------------------------------- confirm gating
+
+
+def test_unconfirmed_payment_rejected_before_handler():
+    node = FakeNanoNode(cemented=False)
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+    resp = run(gate(node, store), make_request(verified_state()), handler)
+    assert handler.runs == 0
+    assert "not confirmed" in str(resp.body.decode())
+
+
+def test_wrong_payee_rejected_before_handler():
+    node = FakeNanoNode(payee=OTHER)
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+    resp = run(gate(node, store), make_request(verified_state()), handler)
+    assert handler.runs == 0
+    assert "does not match" in str(resp.body.decode())
+
+
+def test_wrong_amount_rejected_before_handler():
+    node = FakeNanoNode(amount="999999")
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+    resp = run(gate(node, store), make_request(verified_state()), handler)
+    assert handler.runs == 0
+
+
+def test_confirmed_payment_runs_handler_once_then_replays():
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+
+    req1 = make_request(verified_state())
+    r1 = run(gate(node, store), req1, handler)
+    assert r1.status_code == 200
+    assert handler.runs == 1
+    assert store.get(HASH).status == "completed"
+
+    # Same payment, same request (same path/method) -> recover, do not re-run.
+    r2 = run(gate(node, store), make_request(verified_state()), handler)
+    assert handler.runs == 1
+    assert "replayed" in r2.body.decode()
+
+
+def test_reuse_with_changed_request_is_rejected():
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+
+    run(gate(node, store), make_request(verified_state(), path="/api/paid"), handler)
+    assert handler.runs == 1
+
+    # Same payment presented against a *different* request (different method/path).
+    resp = run(
+        gate(node, store),
+        make_request(verified_state(), method="GET", path="/api/other"),
+        handler,
+    )
+    assert handler.runs == 1
+    assert resp.status_code == 409
+    assert "already consumed by another request" in resp.body.decode()
+
+
+def test_concurrent_same_hash_different_request_rejected():
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(":memory:")
+    handler = FakeHandler()
+
+    req_a = make_request(verified_state(), query_string=b"kind=a")
+    req_b = make_request(verified_state(), query_string=b"kind=b")
+    h_a = FakeHandler()
+    h_b = FakeHandler()
+
+    g = gate(node, store)
+    run(g, req_a, h_a)
+    resp_b = run(g, req_b, h_b)
+    assert h_a.runs == 1
+    assert h_b.runs == 0
+    assert "consumed by another request" in str(resp_b.body.decode())
+
+
+def test_crash_between_consume_and_complete_records_unknown_and_does_not_rerun():
+    # A reservation that was bound but never completed is NOT re-run.
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(":memory:")
+    key = canonical_request_key(method="POST", path="/api/paid")
+    store.bind(ConsumptionRow(send_hash=HASH, request_key=key, status="pending"))
+    handler = FakeHandler()
+    resp = run(gate(node, store), make_request(verified_state()), handler)
+    # pending-but-not-stale for the SAME request: in flight -> do not re-run
+    assert handler.runs == 0
+    row = store.get(HASH)
+    assert row.status in ("pending", "outcome_unknown")
+
+
+def test_aged_out_pending_request_declares_outcome_unknown(tmp_path):
+    node = FakeNanoNode(cemented=True)
+    store = SqliteConsumptionStore(str(tmp_path / "c.db"))
+    key = canonical_request_key(method="POST", path="/api/paid")
+    store.bind(ConsumptionRow(send_hash=HASH, request_key=key, created_at=1_000.0))
+    # age_out_seconds=30, now=2000 -> stale -> outcome_unknown, never re-run
+    from x402_nano_exact.consumption import consume
+
+    d = consume(store, send_hash=HASH, request_key=key, age_out_seconds=30.0, now=2_000.0)
+    assert d.kind == "outcome_unknown"
+    assert store.get(HASH).status == "outcome_unknown"

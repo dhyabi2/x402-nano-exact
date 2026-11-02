@@ -12,6 +12,14 @@ Usage::
 """
 
 from .address import is_nano_address, normalize_nano_address
+from .confirmation import (
+    BlockFacts,
+    ConfirmationAuthority,
+    ConfirmationCheck,
+    NanoNode,
+    normalize_pay_to,
+    require_hex_64,
+)
 from .constants import (
     ASSET_XNO,
     NETWORK_NANO_MAINNET,
@@ -19,7 +27,17 @@ from .constants import (
     SCHEME_EXACT,
     SEND_BLOCK_WORK_THRESHOLD,
 )
+from .consumption import (
+    ConcurrentBind,
+    ConsumptionRow,
+    ConsumptionStore,
+    ConsumeDecision,
+    canonical_request_key,
+    consume,
+)
 from .server import ExactNanoScheme, xno_to_raw
+from .rpc_node import HttpNanoNode, NanoRpcError
+from .sqlite_store import SqliteConsumptionStore
 
 ExactNanoServerScheme = ExactNanoScheme
 """SDK-style alias (cf. ``x402.mechanisms.tvm.exact.ExactTvmServerScheme``)."""
@@ -30,9 +48,24 @@ __all__ = [
     "RAW_PER_XNO",
     "SCHEME_EXACT",
     "SEND_BLOCK_WORK_THRESHOLD",
+    "ConcurrentBind",
+    "ConfirmationAuthority",
+    "ConfirmationCheck",
+    "ConsumeDecision",
+    "ConsumptionRow",
+    "ConsumptionStore",
+    "BlockFacts",
     "ExactNanoScheme",
     "ExactNanoServerScheme",
+    "HttpNanoNode",
+    "NanoNode",
+    "NanoRpcError",
+    "SqliteConsumptionStore",
+    "canonical_request_key",
+    "consume",
     "is_nano_address",
     "normalize_nano_address",
+    "normalize_pay_to",
+    "require_hex_64",
     "xno_to_raw",
 ]

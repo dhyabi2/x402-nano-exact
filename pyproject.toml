@@ -26,7 +26,7 @@ Facilitator = "https://facilitator.pursekeeper.dev"
 [project.optional-dependencies]
 http = ["x402[httpx]>=2.22.0"]
 fastapi = ["x402[httpx,fastapi]>=2.22.0"]
-dev = ["pytest>=8", "x402[httpx]>=2.22.0"]
+dev = ["pytest>=8", "x402[httpx]>=2.22.0", "fastapi>=0.110", "httpx>=0.27"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/x402_nano_exact"]

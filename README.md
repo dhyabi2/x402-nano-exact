@@ -142,3 +142,63 @@ pip install -e ".[dev]"
 pytest                    # offline: SDK-built 402 shape and verify path with a fake facilitator
 X402_NANO_LIVE=1 pytest   # plus one live /supported + malformed /verify against facilitator.pursekeeper.dev
 ```
+
+## Consumption-binding middleware (confirm + single-use)
+
+The SDK's `payment_middleware` verifies a payment and settles it, but it does
+**not** (by itself) guarantee that the confirmed send is redeemed by *exactly
+one* protected request, nor that a retry of the same request recovers its
+stored outcome instead of re-running the handler. `x402-nano-exact` ships a
+small, source-only middleware that adds those two guarantees on the
+resource-server side:
+
+```python
+from fastapi import FastAPI
+from x402 import x402ResourceServer
+from x402.http import FacilitatorConfig, HTTPFacilitatorClient
+from x402.http.middleware.fastapi import payment_middleware
+from x402_nano_exact import ExactNanoServerScheme
+from x402_nano_exact.confirmation import ConfirmationAuthority
+from x402_nano_exact.middleware import nano_consumption_middleware
+from x402_nano_exact.rpc_node import HttpNanoNode
+from x402_nano_exact.sqlite_store import SqliteConsumptionStore
+
+server = x402ResourceServer([HTTPFacilitatorClient(FacilitatorConfig(url="https://facilitator.pursekeeper.dev"))])
+server.register("nano:mainnet", ExactNanoServerScheme())
+server.initialize()
+routes = {"GET /api/weather": {"accepts": [{"scheme": "exact", "network": "nano:mainnet", "payTo": "nano_...", "price": "0.01"}]}}
+
+app = FastAPI()
+# Outer: x402's verify -> handler -> settle flow.
+app.middleware("http")(payment_middleware(routes, server))
+# Inner (registered after): confirm cementation + bind the payment to one request.
+app.middleware("http")(
+    nano_consumption_middleware(
+        ConfirmationAuthority(HttpNanoNode()),           # Nano RPC = the confirmation authority
+        SqliteConsumptionStore("consumption.db"),        # durable single-use ledger
+        body_include=["prompt"],                          # bind to these body/query inputs too
+    )
+)
+```
+
+What it enforces for every `nano:mainnet` / `exact` verified payment:
+
+* **Confirmation of the exact quoted send hash.** The payment is served only
+  after the quoted send block is *cemented* by the node you point at (default
+  `https://rpc.nano.to`), and only when that block's recipient and amount equal
+  the quoted `payTo`/`amount`. A `process-accept` hash, a newer account
+  frontier, or a cemented block that pays a different payee/amount is not
+  confirmation.
+* **Single-use, bound to the request.** The confirmed send is keyed in the
+  durable store to the canonical request (method + path + chosen query/body
+  inputs — never a caller-chosen request id alone). Presenting the same
+  payment against a *different* request is rejected (409); a retry of the
+  *same* request recovers the stored outcome and never runs the handler twice.
+* **Crash-safe outcomes.** If the process dies between consuming the payment
+  and recording the handler result, the row is retained as `outcome_unknown`
+  (after an age-out) rather than re-running the handler's side effects or
+  claiming an atomic HTTP guarantee.
+
+It never signs, publishes or funds anything, and it leaves the SDK's own
+`verify`/`settle` in place — it only adds the two guarantees the stack does
+not currently provide.
