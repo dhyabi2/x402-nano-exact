@@ -48,6 +48,7 @@ from .consumption import (
     ConsumptionStore,
     canonical_request_key,
     consume,
+    query_pairs,
 )
 
 if TYPE_CHECKING:
@@ -147,14 +148,15 @@ class NanoConsumptionMiddleware:
             return self._unconfirmed_response(check)
 
         # Build the canonical request key (bind to the request, not a caller id).
-        # Pass the raw multi_items() pairs, NOT dict(request.params):
-        # the dict collapses repeated keys (a=1&a=2 would collide with a=2).
+        # Pass every decoded pair, NOT dict(request.params): the dict collapses
+        # repeated keys (a=1&a=2 would collide with a=2). query_pairs() also
+        # keeps a bare key (?a) distinct from a blank value (?a=).
         if self._body_include:
             await self._capture_body(request)
         key = canonical_request_key(
             method=request.method,
             path=request.scope.get("root_path", "") + request.url.path,
-            query=list(request.query_params.multi_items()),
+            query=query_pairs(request.scope.get("query_string", b"")),
             query_include=self._query_include,
             body_include=self._body_include,
             body=getattr(request.state, "consumption_body", None),

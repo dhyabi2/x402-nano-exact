@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import time
+from urllib.parse import parse_qsl
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -190,11 +191,30 @@ def consume(
 # ---------------------------------------------------------------------------
 
 
+def query_pairs(query_string: bytes | str) -> list[tuple[str, str | None]]:
+    """Decode a raw query string into ``(key, value)`` pairs, keeping bare keys.
+
+    Decoding matches Starlette's ``QueryParams`` (latin-1 bytes, then
+    ``parse_qsl`` with UTF-8 percent-decoding), except that a segment with no
+    ``=`` yields ``value=None``: ``?a`` (bare) and ``?a=`` (blank) are
+    different requests and must not share a key.
+    """
+    if isinstance(query_string, bytes):
+        query_string = query_string.decode("latin-1")
+    pairs: list[tuple[str, str | None]] = []
+    for segment in query_string.split("&"):
+        if not segment:
+            continue
+        ((key, value),) = parse_qsl(segment, keep_blank_values=True)
+        pairs.append((key, value if "=" in segment else None))
+    return pairs
+
+
 def canonical_request_key(
     *,
     method: str,
     path: str,
-    query: dict[str, str | list[str]] | list[tuple[str, str]] | None = None,
+    query: dict[str, str | list[str]] | list[tuple[str, str | None]] | None = None,
     query_include: list[str] | None = None,
     body_include: list[str] | None = None,
     body: dict | None = None,
@@ -211,7 +231,8 @@ def canonical_request_key(
     is preferred: ``dict(QueryParams)`` collapses repeated keys (``a=1&a=2``
     becomes ``{'a': '2'}`` and would collide with ``a=2``), whereas the pair
     form keeps every value distinct so ``a=1&a=2`` and ``a=2`` differ. A dict
-    value may be a list of strings for a repeated key.
+    value may be a list of strings for a repeated key. A ``None`` value (see
+    :func:`query_pairs`) is a bare key with no ``=`` and differs from ``""``.
 
     The key is a JSON document of the decoded components (the query as a
     sorted list of ``[key, value]`` pairs), so two distinct requests never
@@ -222,18 +243,18 @@ def canonical_request_key(
     # query value or body value can be confused with the key's own structure
     # (e.g. ``a=1&a=2`` vs ``a=1%262``, or path ``/p`` + ``a=1`` vs a path
     # that decodes to ``/p|query:a=1``).
-    pairs: list[tuple[str, str]] = []
+    pairs: list[tuple[str, str | None]] = []
     if query:
         items = query.items() if isinstance(query, dict) else query
         for k, v in items:
             if query_include is not None and k not in query_include:
                 continue
             values = v if isinstance(v, (list, tuple)) else [v]
-            pairs.extend((str(k), str(one)) for one in values)
+            pairs.extend((str(k), None if one is None else str(one)) for one in values)
     # Order-insensitive: the same multiset of decoded (key, value) pairs in a
     # different order (``b=2&a=1`` vs ``a=1&b=2``, ``a=2&a=1`` vs ``a=1&a=2``)
     # is the same request.
-    pairs.sort()
+    pairs.sort(key=lambda p: (p[0], p[1] is not None, p[1] or ""))
     canonical: dict = {
         "method": method.upper(),
         "path": path,

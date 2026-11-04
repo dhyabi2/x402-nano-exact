@@ -387,3 +387,66 @@ def test_canonical_key_components_are_unambiguous():
     assert k(method="POST", path="/p", body_include=["a"], body={"a": 1}) != k(
         method="POST", path="/p", body_include=["a"], body={"a": "1"}
     )
+
+
+# ------------------------ query-binding corpus: four categories (2026-11-04)
+# Our own cases for the four categories epistemedeus listed on #4: duplicate
+# values, delimiter impersonation, Unicode, meaningful empty values. Each pair
+# is two distinct requests; the second must NOT redeem the first's payment.
+
+import pytest  # noqa: E402
+
+NFC_E = b"%C3%A9"  # U+00E9
+NFD_E = b"e%CC%81"  # U+0065 U+0301
+
+QUERY_DISTINCT_CASES = [
+    # duplicate values
+    pytest.param(b"a=1&a=2", b"a=1%262", id="dup-repeated-vs-encoded-amp"),
+    pytest.param(b"a=1&a=1", b"a=1", id="dup-same-value-twice-vs-once"),
+    pytest.param(b"a=1&a=2", b"a=2", id="dup-two-values-vs-last"),
+    pytest.param(b"a=1&b=2&a=1", b"a=1&b=2", id="dup-interleaved-vs-single"),
+    # delimiter impersonation
+    pytest.param(b"a=1&b=2", b"a=1%26b%3D2", id="delim-encoded-amp-eq-in-value"),
+    pytest.param(b"a%3D1=2", b"a=1%3D2", id="delim-encoded-eq-key-vs-value"),
+    pytest.param(b"a=1;b=2", b"a=1&b=2", id="delim-semicolon-vs-amp"),
+    pytest.param(b"a+b=1", b"a%2Bb=1", id="delim-plus-space-vs-encoded-plus"),
+    # Unicode
+    pytest.param(b"a=" + NFC_E, b"a=" + NFD_E, id="uni-nfc-vs-nfd-value"),
+    pytest.param(NFC_E + b"=1", NFD_E + b"=1", id="uni-nfc-vs-nfd-key"),
+    pytest.param("a=é".encode(), b"a=" + NFC_E, id="uni-raw-utf8-vs-percent"),
+    # meaningful empty values
+    pytest.param(b"a=", b"a", id="empty-blank-vs-bare"),
+    pytest.param(b"a=", b"", id="empty-blank-vs-absent"),
+    pytest.param(b"a", b"", id="empty-bare-vs-absent"),
+    pytest.param(b"a=&b", b"a&b=", id="empty-swapped-bare-and-blank"),
+]
+
+
+@pytest.mark.parametrize("first_qs,second_qs", QUERY_DISTINCT_CASES)
+def test_distinct_queries_do_not_share_a_payment(first_qs, second_qs):
+    for one, two in ((first_qs, second_qs), (second_qs, first_qs)):
+        r1, r2, handler = _first_then_second(one, two)
+        assert r1.status_code == 200
+        assert r2.status_code == 409, (one, two)
+        assert handler.runs == 1
+
+
+@pytest.mark.parametrize(
+    "qs", sorted({p for case in QUERY_DISTINCT_CASES for p in case.values})
+)
+def test_byte_identical_query_replays(qs):
+    r1, r2, handler = _first_then_second(qs, qs)
+    assert r1.status_code == 200
+    assert handler.runs == 1
+    assert "replayed" in r2.body.decode()
+
+
+def test_query_pairs_matches_starlette_decoding_and_keeps_bare_keys():
+    from starlette.datastructures import QueryParams
+
+    from x402_nano_exact.consumption import query_pairs
+
+    for qs in (b"a=1&a=2", b"a=1%262", b"a+b=1;c", b"a=" + NFD_E, "a=é".encode(), b"&&a=&b"):
+        decoded = [(k, "" if v is None else v) for k, v in query_pairs(qs)]
+        assert decoded == QueryParams(qs).multi_items()
+    assert query_pairs(b"a=&b") == [("a", ""), ("b", None)]
